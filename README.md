@@ -1,6 +1,7 @@
 # ReSCILLMs:
 
-Comparing for the Best: Reinforcement Learning for Source Citation Identification with Large Language Models}
+Comparing for the Best: Reinforcement Learning for Source Citation Identification with Large Language Models
+
 Under review.
 
 ## Prerequisites
