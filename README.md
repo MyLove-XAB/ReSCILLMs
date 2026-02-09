@@ -60,4 +60,5 @@ export PYTHONPATH="`pwd`:$PYTHONPATH"
      
      ```bash
      python RLmethod/PPOAgent.py
+     python RLmethod/Agent_lora.py
      ```
