@@ -12,6 +12,7 @@ import pickle
 import json
 from tqdm import tqdm
 from Logtool import CreateLog
+import time
 
 
 class PPOmemory(object):
@@ -31,6 +32,8 @@ class PPOmemory(object):
         indices = np.arange(n_states, dtype=np.int64)  # 记录编号[0,1,2....19]
         np.random.shuffle(indices)  # 打乱编号顺序[3,1,9,11....18]
         mini_batches = [indices[i:i + self.mini_batch_size] for i in batch_start]
+        # 生成4个minibatch，每个minibatch记录乱序且不重复，用于后续学习更新网络
+        # state = np.array([np.array(x) for x in self.states])
 
         return (self.states,
                 torch.tensor(np.array([tensor.numpy() for tensor in self.actions])),
@@ -64,6 +67,8 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
         self.fc1 = nn.Linear(feature_size*3, feature_size)
         self.fc2 = nn.Linear(feature_size, 2)
+        # self.fc3 = nn.Linear(512, 128)
+        # self.fc4 = nn.Linear(128, 2)
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
         self.dropout = nn.Dropout(0.5)
@@ -72,9 +77,13 @@ class Actor(nn.Module):
         # 初始化权重
         torch.nn.init.xavier_uniform_(self.fc1.weight)
         torch.nn.init.xavier_uniform_(self.fc2.weight)
+        # torch.nn.init.xavier_uniform_(self.fc3.weight)
+        # torch.nn.init.xavier_uniform_(self.fc4.weight)
 
     def forward(self, x):
         x = self.tanh(self.fc1(x))
+        # x = self.tanh(self.fc2(x))
+        # x = self.tanh(self.fc3(x))
         x = self.fc2(x)
         return x
 
@@ -95,6 +104,8 @@ class Critic(nn.Module):
 
     def forward(self, x):
         x = self.tanh(self.fc1(x))
+        # x = self.tanh(self.fc2(x))
+        # x = self.tanh(self.fc3(x))
         x = self.fc2(x)
         return x
 
@@ -127,12 +138,12 @@ class ActorCritic(nn.Module):
         return ac, v
 
     def get_action(self, state, signal="train"):
-        logits_, _ = self.forward(state, signal)
+        logits_, value = self.forward(state, signal)
         probs = torch.softmax(logits_, dim=-1)
         dist = Categorical(probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action.item(), log_prob, probs.data.cpu().numpy()[0]
+        return action.item(), log_prob, probs.data.cpu().numpy()[0], value
 
     def get_global_embedding(self, paper, signal="train"):      # update global state
         # get the global state
@@ -252,6 +263,8 @@ class PPO(object):
             self.actor_critic.train()
             find = 0
             steps = 0
+            t_train = time.time()
+            log.info("-------------START TRAINING----------------")
             for samp in range(sample_size):
                 state, global_state = self.env.reset()
                 # global_state = list(global_states.keys())[0]
@@ -263,9 +276,12 @@ class PPO(object):
                 while not done:
                     # 与环境交互
                     steps += 1
-                    action, log_prob, p = self.actor_critic.get_action(state, signal="train")          # , p
-                    next_state, reward, done, info_, step_ = self.env.step(action, p[1])
-                    _, value = self.actor_critic(state)
+                    action, log_prob, p, value = self.actor_critic.get_action(state, signal="train")          # , p
+                    next_state, reward, done, info_, step_ = self.env.step(action)
+                    # print(id(state))
+                    # print(id(next_state))
+                    # next_state = torch.tensor(next_state, dtype=torch.float32).to(self.device)
+                    # _, value = self.actor_critic(state)
                     log_ = torch.squeeze(log_prob).item()
 
                     # 存储数据
@@ -279,12 +295,22 @@ class PPO(object):
 
             # 打印每回合的总奖励
             # print(f"Episode {episode+1}, Find Rate: {find/sample_size}")
+            t_train_end = time.time()
+            log.info("--------------END TRAINING----------------, time spent: {} s, {} min".format(t_train_end - t_train, (t_train_end - t_train) / 60))
+
             train_rewards.append(find/sample_size)
+
+            peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            log.info(f"Peak GPU memory during training: {peak_memory_gb:.2f} GB")
 
             if episode % TEST_EPOCH == 0:
                 # test
                 self.actor_critic.eval()
+                t_test = time.time()
+                log.info("--------------START TEST----------------")
                 success_rate, map = self.env.test_env(self.actor_critic)
+                t_test_end = time.time()
+                log.info("--------------END TEST----------------, time spent: {} s, {} min".format(t_test_end-t_test, (t_test_end-t_test)/60))
                 print("iter: %s, test reward: %s, test map: %s" % (episode, success_rate, map))
                 log.info("iter: %s, test reward: %s, test map: %s" % (episode, success_rate, map))
                 test_rewards.append(success_rate)
@@ -301,28 +327,31 @@ class PPO(object):
             json.dump(res_dic, f)
 
 
-# def case():
-#     # ppo = PPO(env, mbsize=MBSIZE, lr=LR, update_epochs=2)
-#     for i in range(1, 11):
-#         try:
-#             ppo.actor_critic.load_state_dict(torch.load(join(MODEL_DIR, MODEL + "_policy_run_{}.pth".format(i))))
-#             print("load model: ", i)
-#             ppo.actor_critic.eval()
-#             success_rate, map = env.case(ppo.actor_critic)
+def case():
+    # ppo = PPO(env, mbsize=MBSIZE, lr=LR, update_epochs=2)
+    for i in range(1, 11):
+        try:
+            ppo.actor_critic.load_state_dict(torch.load(join(MODEL_DIR, MODEL + "_policy_run_{}.pth".format(i))))
+            print("load model: ", i)
+            ppo.actor_critic.eval()
+            success_rate, map = env.case(ppo.actor_critic)
 
-#             with open(join(save_dir, "case_result_{}.json".format(env.test_iter)), "w") as f:
-#                 json.dump(env.case_result, f)
-#             print("test reward: %s, test map: %s" % (success_rate, map))
-#             log.info("test reward: %s, test map: %s" % (success_rate, map))
-#         except:
-#             pass
+            with open(join(save_dir, "case_result_{}.json".format(env.test_iter)), "w") as f:
+                json.dump(env.case_result, f)
+            print("test reward: %s, test map: %s" % (success_rate, map))
+            log.info("test reward: %s, test map: %s" % (success_rate, map))
+        except:
+            pass
 
 
 if __name__ == "__main__":
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()  # ⭐ 关键：清零历史峰值
+
     save_dir = join(settings.PROJ_DIR, "data_processed")
     MODEL_DIR = join(settings.PROJ_DIR, "saved_models")
     result_dir = join(settings.PROJ_DIR, "out")
-    MODEL = "llama2"        # scibert, llama2, gemma2
+    MODEL = "gemma2"        # scibert, llama2, gemma2
     print("MODEL: ", MODEL)
     log = CreateLog(name="rose_log", filename=join(result_dir, MODEL+"_wg_log_3.log"), t_stamp=False, add_fh=True)
 
@@ -365,5 +394,3 @@ if __name__ == "__main__":
     ppo.train(n_iter=N_ITER, sample_size=SAMPLE_SIZE)
 
     # case()
-
-

@@ -33,7 +33,32 @@ class PSTEnv(object):
         self.truth_index = utils.load_json(save_dir, "ground_truth_index.json")
         self.truth_bid = utils.load_json(save_dir, "ground_truth_bid.json")
 
-        self.entity_embeddings = torch.load(join(save_dir, 'TransE_ett_emb.pth'))
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.entity_embeddings = {k: torch.tensor(v, dtype=torch.float32, device=self.device)
+                                  for k, v in torch.load(join(save_dir, 'TransE_ett_emb.pth')).items()}
+        self.default_emb = torch.zeros(200, dtype=torch.bfloat16, device=self.device)  # 根据 feature_size 调整
+        # self.entity_embeddings = torch.load(join(save_dir, 'TransE_ett_emb.pth'))
+
+        # 【优化 2】预解析所有 GT ID 映射，避免 reset 时重复运行那 15 行判断逻辑
+        self.gt_id_map = {}
+        for qp in (self.train_keys + self.valid_keys):
+            temp_gt = []
+            for i, tmp in enumerate(self.truth_index.get(qp, [])):
+                if tmp and tmp in self.entity_embeddings:
+                    temp_gt.append(tmp)
+                else:
+                    try:
+                        gt = qp + self.truth_bid[qp][i]
+                        if gt in self.entity_embeddings:
+                            temp_gt.append(gt)
+                    except:
+                        continue
+            self.gt_id_map[qp] = temp_gt if temp_gt else [self.query_paper]
+
+        self.gt_matrix_map = {}
+        for qp, ids in self.gt_id_map.items():
+            # 将该 paper 对应的所有 GT embedding 堆叠成 [N, Dim] 的矩阵
+            self.gt_matrix_map[qp] = torch.stack([self.entity_embeddings.get(i, self.default_emb) for i in ids])
 
         self.index = -1
         # self.batch_size = 32
@@ -58,31 +83,18 @@ class PSTEnv(object):
         self.previous_paper = self.cur_data[self.steps]         # used to save the best paper
         self.cur_paper = self.cur_data[self.steps + 1]
 
-        self.gt_ls = []
-        for i, tmp in enumerate(self.truth_index[self.query_paper]):
-            if tmp:
-                if tmp in self.entity_embeddings.keys():
-                    self.gt_ls.append(tmp)
-            else:
-                try:
-                    gt = self.query_paper + self.truth_bid[self.query_paper][i]
-                    if gt in self.entity_embeddings.keys():
-                        self.gt_ls.append(gt)
-                except:
-                    continue
+        # 直接从缓存取 GT IDs，并堆叠为矩阵, reset 阶段预先堆叠：
+        # self.gt_ls = self.gt_id_map[self.query_paper]
+        self.global_paper_matrix = self.gt_matrix_map[self.query_paper]
 
-        if not self.gt_ls:
-            self.gt_ls.append(self.query_paper)    # 如果没有ground truth bid，就用当前的paper
+        p_id = self.previous_paper[0] or (self.query_paper + self.previous_paper[1])
+        self.previous_paper_emb = self.entity_embeddings.get(p_id, self.default_emb)
 
-        self.global_paper_emb_ls = []
-        for gt in self.gt_ls:
-            self.global_paper_emb_ls.append(torch.tensor(self.entity_embeddings[gt]))
-
-        if self.previous_paper[0]:
-            self.previous_paper_emb = torch.tensor(self.entity_embeddings[self.previous_paper[0]])
-        else:
-            self.previous_paper_emb = torch.tensor(self.entity_embeddings[self.query_paper+self.previous_paper[1]])
-        self.previous_similarity = max([torch.cosine_similarity(global_paper_emb, self.previous_paper_emb, dim=0) for global_paper_emb in self.global_paper_emb_ls])
+        # 计算阶段一次性广播：
+        # cosine_similarity 支持 [num_gt, dim] 与 [dim] 的广播计算
+        sims = torch.nn.functional.cosine_similarity(self.global_paper_matrix, self.previous_paper_emb.unsqueeze(0))
+        self.previous_similarity = sims.max()
+        # self.previous_similarity = max([torch.cosine_similarity(global_paper_emb, self.previous_paper_emb, dim=0) for global_paper_emb in self.global_paper_emb_ls])
 
         self.global_state = self.query_paper
 
@@ -149,7 +161,7 @@ class PSTEnv(object):
     def get_reward(self):
         # if ranking, return ranking_reward()
         if self.ranking:
-            return self.ranking_reward()
+            return self.ranking_reward()            # 并没有用到
         # else, return naive_reward()
         else:
             return self.naive_reward()
@@ -157,22 +169,19 @@ class PSTEnv(object):
     def calculate_score(self):
         pass
 
-    def step(self, action, p):
+    def step(self, action):
         self.steps += 1
         # get the reward
 
         # if action > 0.5:        # deterministic
         if np.random.random() < action:     # stochastic, 认为cur_paper优于previous_paper, 则更新pre为cur
-            if self.cur_paper[0]:
-                try:
-                    self.cur_paper_emb = torch.tensor(self.entity_embeddings[self.cur_paper[0]])
-                except KeyError:
-                    print(f"paper{self.query_paper}'s reference {self.cur_paper} does not exist in entity embeddings")
-            else:
-                self.cur_paper_emb = torch.tensor(self.entity_embeddings[self.query_paper + self.cur_paper[1]])
-            self.cur_similarity = max([torch.cosine_similarity(global_paper_emb, self.cur_paper_emb, dim=0) for global_paper_emb in self.global_paper_emb_ls])
-            self.previous_paper = self.cur_paper
+            cur_id = self.cur_paper[0] or (self.query_paper + self.cur_paper[1])
+            self.cur_paper_emb = self.entity_embeddings.get(cur_id, self.default_emb)
+            cur_sims = torch.cosine_similarity(self.global_paper_matrix, self.cur_paper_emb.unsqueeze(0))
+            self.cur_similarity = cur_sims.max()
+
             graph_reward = (self.cur_similarity - self.previous_similarity).item()
+            self.previous_paper = self.cur_paper
             self.previous_similarity = self.cur_similarity       # update
         else:
             graph_reward = 0        # 如果不更新previous_paper，graph_reward为0
@@ -184,10 +193,8 @@ class PSTEnv(object):
         else:
             self.done = False
             # get the next state
-
             # 否则previous_paper仍然是当前最好的，不更新previous_paper，只更新cur_paper
             self.cur_paper = self.cur_data[self.steps + 1]
-
             self.state = [self.previous_paper[1], self.cur_paper[1]]
 
         # graph_reward = self.previous_similarity
@@ -220,31 +227,11 @@ class PSTEnv(object):
             self.previous_paper = self.cur_data[self.steps]
             self.cur_paper = self.cur_data[self.steps + 1]
 
-            self.gt_ls = []
-            for i, tmp in enumerate(self.truth_index[self.query_paper]):
-                if tmp:
-                    if tmp in self.entity_embeddings.keys():
-                        self.gt_ls.append(tmp)
-                else:
-                    try:
-                        gt = self.query_paper + self.truth_bid[self.query_paper][i]
-                        if gt in self.entity_embeddings.keys():
-                            self.gt_ls.append(gt)
-                    except:
-                        continue
+            self.global_paper_matrix = self.gt_matrix_map[self.query_paper]
 
-            if not self.gt_ls:
-                self.gt_ls.append(self.query_paper)  # 如果没有ground truth bid，就用当前的paper
-
-            self.global_paper_emb_ls = []
-            for gt in self.gt_ls:
-                self.global_paper_emb_ls.append(torch.tensor(self.entity_embeddings[gt]))
-
-            if self.previous_paper[0]:
-                self.previous_paper_emb = torch.tensor(self.entity_embeddings[self.previous_paper[0]])
-            else:
-                self.previous_paper_emb = torch.tensor(self.entity_embeddings[self.query_paper + self.previous_paper[1]])
-            self.previous_similarity = max([torch.cosine_similarity(global_paper_emb, self.previous_paper_emb, dim=0) for global_paper_emb in self.global_paper_emb_ls])
+            p_id = self.previous_paper[0] or (self.query_paper + self.previous_paper[1])
+            self.previous_paper_emb = self.entity_embeddings.get(p_id, self.default_emb)
+            self.previous_similarity = torch.nn.functional.cosine_similarity(self.global_paper_matrix, self.previous_paper_emb.unsqueeze(0)).max()
 
             self.global_state = self.query_paper
             actor.global_paper = self.global_state
@@ -261,13 +248,10 @@ class PSTEnv(object):
 
             while not done:
                 # p = [0, 0]
-                action, log_prob, p = actor.get_action(self.state, signal="test")          # use cls token
+                action, log_prob, p, v = actor.get_action(self.state, signal="test")          # use cls token
                 p_list.append(float(p[1]))
-                if p[1] > 0.5:
-                    action = 1
-                else:
-                    action = 0
-                next_state, reward, done, info_, step_ = self.step(action, p[1])       # p[1]: probability of action==1
+                action = 1 if p[1] > 0.5 else 0
+                next_state, reward, done, info_, step_ = self.step(action)       # p[1]: probability of action==1
                 # log_probs.append(log_prob)
                 rewards.append(reward)          # .item()
                 self.state = next_state
@@ -282,7 +266,6 @@ class PSTEnv(object):
             map_ls.append(tmp_map)
             if self.finally_found:            # if finally found, then success
                 self.success += 1
-                
         return self.success / len(self.valid_data), sum(map_ls)/len(map_ls)      # success rate
 
     def case(self, actor):
@@ -311,34 +294,11 @@ class PSTEnv(object):
             self.previous_paper = self.cur_data[self.steps]
             self.cur_paper = self.cur_data[self.steps + 1]
 
-            self.gt_ls = []
-            for i, tmp in enumerate(self.truth_index[self.query_paper]):
-                if tmp:
-                    if tmp in self.entity_embeddings.keys():
-                        self.gt_ls.append(tmp)
-                else:
-                    try:
-                        gt = self.query_paper + self.truth_bid[self.query_paper][i]
-                        if gt in self.entity_embeddings.keys():
-                            self.gt_ls.append(gt)
-                    except:
-                        continue
+            self.global_paper_matrix = self.global_paper_matrix[self.query_paper]
 
-            if not self.gt_ls:
-                self.gt_ls.append(self.query_paper)  # 如果没有ground truth bid，就用当前的paper
-
-            self.global_paper_emb_ls = []
-            for gt in self.gt_ls:
-                self.global_paper_emb_ls.append(torch.tensor(self.entity_embeddings[gt]))
-
-            if self.previous_paper[0]:
-                self.previous_paper_emb = torch.tensor(self.entity_embeddings[self.previous_paper[0]])
-            else:
-                self.previous_paper_emb = torch.tensor(
-                    self.entity_embeddings[self.query_paper + self.previous_paper[1]])
-            self.previous_similarity = max(
-                [torch.cosine_similarity(global_paper_emb, self.previous_paper_emb, dim=0) for global_paper_emb in
-                 self.global_paper_emb_ls])
+            p_id = self.previous_paper[0] or (self.query_paper + self.previous_paper[1])
+            self.previous_paper_emb = self.entity_embeddings.get(p_id, self.default_emb)
+            self.previous_similarity = torch.nn.functional.cosine_similarity(self.global_paper_matrix, self.previous_paper_emb.unsqueeze(0)).max()
 
             self.global_state = self.query_paper
             actor.global_paper = self.global_state
@@ -355,13 +315,10 @@ class PSTEnv(object):
 
             while not done:
                 # p = [0, 0]
-                action, log_prob, p = actor.get_action(self.state, signal="test")  # use cls token
+                action, log_prob, p, v = actor.get_action(self.state, signal="test")  # use cls token
                 p_list.append(float(p[1]))
-                if p[1] > 0.5:
-                    action = 1
-                else:
-                    action = 0
-                next_state, reward, done, info_, step_ = self.step(action, p[1])  # p[1]: probability of action==1
+                action = 1 if p[1] > 0.5 else 0
+                next_state, reward, done, info_, step_ = self.step(action)  # p[1]: probability of action==1
 
                 self.state = next_state
                 self.prev_ls.append(self.previous_paper)
@@ -429,4 +386,4 @@ if __name__ == '__main__':
         state, global_state = env.reset()
         while not env.done:
             action = torch.tensor([0.6])
-            s, r, done, info, steps = env.step(action, action)
+            s, r, done, info, steps = env.step(action)

@@ -1,0 +1,15 @@
+numba
+pandas
+beautifulsoup4
+fuzzywuzzy
+numpy
+scikit_learn
+torch
+torchvision
+torchaudio
+tqdm
+transformers
+python-Levenshtein
+lxml
+cogdl
+bitsandbytes

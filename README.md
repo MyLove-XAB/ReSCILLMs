@@ -45,6 +45,7 @@ export PYTHONPATH="`pwd`:$PYTHONPATH"
      python processed_data/process_dagit ta.py
      python processed_data/text_llm_vec.py
      python processed_data/divided_llmvec.py
+     python processed_data/paper_text_extract.py
      ```
 
 - 2. process the graph embedding:
