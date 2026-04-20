@@ -7,7 +7,7 @@ import utils
 from torch.distributions import Categorical
 from pstenv import PSTEnv
 from os.path import join
-from processed_data.text_llm_vec import get_local_llm_vec, get_global_llm_vec, train_data_small, valid_data_small
+# from processed_data.text_llm_vec import get_local_llm_vec, get_global_llm_vec, train_data_small, valid_data_small
 import pickle
 import json
 from tqdm import tqdm
@@ -93,6 +93,8 @@ class Critic(nn.Module):
         super(Critic, self).__init__()
         self.fc1 = nn.Linear(feature_size*3, feature_size)
         self.fc2 = nn.Linear(feature_size, 1)
+        # self.fc3 = nn.Linear(512, 128)
+        # self.fc4 = nn.Linear(128, 1)
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
         self.dropout = nn.Dropout(0.5)
@@ -101,6 +103,8 @@ class Critic(nn.Module):
         # 初始化权重
         torch.nn.init.xavier_uniform_(self.fc1.weight)
         torch.nn.init.xavier_uniform_(self.fc2.weight)
+        # torch.nn.init.xavier_uniform_(self.fc3.weight)
+        # torch.nn.init.xavier_uniform_(self.fc4.weight)
 
     def forward(self, x):
         x = self.tanh(self.fc1(x))
@@ -148,7 +152,7 @@ class ActorCritic(nn.Module):
     def get_global_embedding(self, paper, signal="train"):      # update global state
         # get the global state
         self.global_state = []
-
+        # self.global_paper = paper
         # get the text embedding
         if signal == "train":
             self.global_state = train_global_states[paper]
@@ -216,6 +220,13 @@ class PPO(object):
                     tmp_ = torch.cat([tmp[0], tmp[1], tmp[2]], dim=-1)
                     states_emb_ls.append(tmp_)
 
+                # s_in = []
+                # for s_emb in states_emb_ls:
+                #     # logit, value_new = self.actor_critic(s)
+                #     tmp = self.actor_critic.only_update1(s_emb)
+                #     s_in.append(tmp)
+                # s_in = torch.cat(states_emb_ls, dim=0)
+
                 log_probs_old = torch.tensor(log_probs_old_arr[batch]).cuda() if torch.cuda.is_available() else torch.tensor(log_probs_old_arr[batch])      # shape: [mini_batch_size, 1]
                 # ac_list = actions_arr[batch]
                 actions = actions_arr[batch].to(self.device)  # shape: [mini_batch_size, 1]
@@ -257,13 +268,21 @@ class PPO(object):
 
     def train(self, n_iter=100, sample_size=128):
         res_dic = dict()
+        num = 1
         test_rewards, train_rewards, test_map = [], [], []
         for episode in tqdm(range(n_iter)):
+            # if episode % 10 == 0:
+            #     # test
+            #     self.actor_critic.eval()
+            #     success_rate = self.env.test_env(self.actor_critic)
+            #     print("iter: %s, test reward: %s" % (episode, success_rate))
+            #     test_rewards.append(success_rate)
+            #     torch.save(self.actor_critic.state_dict(), join(MODEL_DIR, "ppo_policy_iter{}.pth".format(episode)))
 
             self.actor_critic.train()
             find = 0
             steps = 0
-            t_train = time.time()
+            # t_train = time.time()
             log.info("-------------START TRAINING----------------")
             for samp in range(sample_size):
                 state, global_state = self.env.reset()
@@ -290,40 +309,43 @@ class PPO(object):
                     state = next_state
                 self.update()
 
+                # 计算价值函数的目标
+                # _, next_value = self.actor_critic(state)
+                # returns = self.compute_returns(rewards, dones, values, next_value.detach())
                 if self.env.finally_found == 1:
                     find += 1
 
             # 打印每回合的总奖励
             # print(f"Episode {episode+1}, Find Rate: {find/sample_size}")
-            t_train_end = time.time()
-            log.info("--------------END TRAINING----------------, time spent: {} s, {} min".format(t_train_end - t_train, (t_train_end - t_train) / 60))
+            # t_train_end = time.time()
+            # log.info("--------------END TRAINING----------------, time spent: {} s, {} min".format(t_train_end - t_train, (t_train_end - t_train) / 60))
 
             train_rewards.append(find/sample_size)
 
-            peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            log.info(f"Peak GPU memory during training: {peak_memory_gb:.2f} GB")
+            # peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            # log.info(f"Peak GPU memory during training: {peak_memory_gb:.2f} GB")
 
             if episode % TEST_EPOCH == 0:
                 # test
                 self.actor_critic.eval()
-                t_test = time.time()
+                # t_test = time.time()
                 log.info("--------------START TEST----------------")
                 success_rate, map = self.env.test_env(self.actor_critic)
-                t_test_end = time.time()
-                log.info("--------------END TEST----------------, time spent: {} s, {} min".format(t_test_end-t_test, (t_test_end-t_test)/60))
+                # t_test_end = time.time()
+                # log.info("--------------END TEST----------------, time spent: {} s, {} min".format(t_test_end-t_test, (t_test_end-t_test)/60))
                 print("iter: %s, test reward: %s, test map: %s" % (episode, success_rate, map))
                 log.info("iter: %s, test reward: %s, test map: %s" % (episode, success_rate, map))
                 test_rewards.append(success_rate)
                 test_map.append(map)
                 if self.max_success_rate < success_rate:
                     self.max_success_rate = success_rate
-                    torch.save(self.actor_critic.state_dict(), join(MODEL_DIR, MODEL+"_policy_run_3.pth"))
+                    torch.save(self.actor_critic.state_dict(), join(MODEL_DIR, MODEL+"_policy_shuffle_run_{}.pth".format(num)))
 
         res_dic["iter"] = list(range(n_iter))
         res_dic["train_reward"] = train_rewards
         res_dic["test_reward"] = test_rewards
         res_dic["test_map"] = test_map
-        with open(join(result_dir, MODEL+"_wg_result_2.json"), "w") as f:
+        with open(join(result_dir, MODEL+"_shuffle_result_{}.json".format(num)), "w") as f:
             json.dump(res_dic, f)
 
 
@@ -331,7 +353,7 @@ def case():
     # ppo = PPO(env, mbsize=MBSIZE, lr=LR, update_epochs=2)
     for i in range(1, 11):
         try:
-            ppo.actor_critic.load_state_dict(torch.load(join(MODEL_DIR, MODEL + "_policy_run_{}.pth".format(i))))
+            ppo.actor_critic.load_state_dict(torch.load(join(MODEL_DIR, MODEL + "_policy_shuffle_run_{}.pth".format(i))))
             print("load model: ", i)
             ppo.actor_critic.eval()
             success_rate, map = env.case(ppo.actor_critic)
@@ -345,15 +367,17 @@ def case():
 
 
 if __name__ == "__main__":
+    # scibert = join(settings.PROJ_DIR, "pretrain_models/bertmodel")
+    # llama2 = join(settings.PROJ_DIR, "pretrain_models/llmamodel/llama2-7b-hf")
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()  # ⭐ 关键：清零历史峰值
 
     save_dir = join(settings.PROJ_DIR, "data_processed")
     MODEL_DIR = join(settings.PROJ_DIR, "saved_models")
     result_dir = join(settings.PROJ_DIR, "out")
-    MODEL = "gemma2"        # scibert, llama2, gemma2
+    MODEL = "scibert"        # scibert, llama2, gemma2
     print("MODEL: ", MODEL)
-    log = CreateLog(name="rose_log", filename=join(result_dir, MODEL+"_wg_log_3.log"), t_stamp=False, add_fh=True)
+    log = CreateLog(name="rose_log", filename=join(result_dir, MODEL+"_shuffle_log_1.log"), t_stamp=False, add_fh=True)
 
     if MODEL == "scibert":
         train_global_states = pickle.load(open(join(save_dir, "train_global_states_scibert.pkl"), "rb"))
@@ -386,8 +410,20 @@ if __name__ == "__main__":
         N_ITER, SAMPLE_SIZE = 600, 788
         TEST_EPOCH = 1
         MBSIZE = 32
+    SHUFFLE_REFS = True
+    SHUFFLE_SEED = 915
+    SHUFFLE_VALID = True
 
-    env = PSTEnv(text=True, graph=False)
+    # global_states = get_global_llm_vec()
+    # local_state = get_local_llm_vec()           # get local state
+
+    env = PSTEnv(
+        text=True,
+        graph=False,
+        shuffle_refs=SHUFFLE_REFS,
+        shuffle_seed=SHUFFLE_SEED,
+        shuffle_valid=SHUFFLE_VALID
+    )
 
     ppo = PPO(env, mbsize=MBSIZE, lr=LR, update_epochs=2)
 

@@ -13,20 +13,37 @@ from sklearn.metrics import average_precision_score
 
 
 class PSTEnv(object):
-    def __init__(self, text=True, graph=True, ranking=False):
+    def __init__(self, text=True, graph=True, ranking=False,
+                 shuffle_refs=False, shuffle_seed=42, shuffle_valid=True):
         self.previous_paper_emb = None
         self.text = text        # whether to use text information
         self.graph = graph      # whether to use graph embedding
+        self.shuffle_refs = shuffle_refs
+        self.shuffle_seed = shuffle_seed
+        
         # train and valid data
         self.train_data = utils.load_json(save_dir, "Train_papers_refs_pair.json")
         self.valid_data = utils.load_json(save_dir, "Valid_papers_refs_pair.json")
         self.gt = utils.load_json(valid_dir, "ground_truths_valid.json")
 
+        # Use a fixed one-time shuffle per paper for controlled experiments.
+        self.train_episode_data = self.train_data
+        self.valid_episode_data = self.valid_data
+        if self.shuffle_refs:
+            self.train_episode_data = self._build_fixed_shuffle_data(self.train_data, self.shuffle_seed)
+            if self.shuffle_valid:
+                self.valid_episode_data = self._build_fixed_shuffle_data(self.valid_data, self.shuffle_seed + 1)
+
         # train and valid keys determine the data order
         self.train_keys = list(self.train_data.keys())
         # shuffle
+        random.seed(shuffle_seed)
         random.shuffle(self.train_keys)
+
         self.valid_keys = list(self.valid_data.keys())
+        # self.train_keys = list(self.train_data.keys())[:4]
+        # self.valid_keys = list(self.valid_data.keys())[:4]
+
 
         # train and valid ground truth
         self.truth_label = utils.load_json(save_dir, "ground_truth_label.json")
@@ -53,7 +70,7 @@ class PSTEnv(object):
                             temp_gt.append(gt)
                     except:
                         continue
-            self.gt_id_map[qp] = temp_gt if temp_gt else [self.query_paper]
+            self.gt_id_map[qp] = temp_gt if temp_gt else [qp]
 
         self.gt_matrix_map = {}
         for qp, ids in self.gt_id_map.items():
@@ -65,6 +82,17 @@ class PSTEnv(object):
         self.ranking = ranking      # whether to use ranking reward
         self.test_iter = 0
         self.count = 0
+
+    @staticmethod
+    def _build_fixed_shuffle_data(data_dict, seed):
+        rng = random.Random(seed)
+        shuffled = {}
+        # Sort keys for deterministic results across runs.
+        for paper_id in sorted(data_dict.keys()):
+            refs = list(data_dict[paper_id])
+            rng.shuffle(refs)
+            shuffled[paper_id] = refs
+        return shuffled
 
     def reset(self):
         # get the initial state
@@ -78,7 +106,7 @@ class PSTEnv(object):
         self.index += 1          # random.randint(0, len(self.train_keys)), or sequentially
         self.done = False
         self.query_paper = self.train_keys[self.index % len(self.train_keys)]           # mod to avoid out of index
-        self.cur_data = self.train_data[self.query_paper]
+        self.cur_data = self.train_episode_data[self.query_paper]
 
         self.previous_paper = self.cur_data[self.steps]         # used to save the best paper
         self.cur_paper = self.cur_data[self.steps + 1]
@@ -175,6 +203,13 @@ class PSTEnv(object):
 
         # if action > 0.5:        # deterministic
         if np.random.random() < action:     # stochastic, 认为cur_paper优于previous_paper, 则更新pre为cur
+            # if self.cur_paper[0]:
+            #     try:
+            #         self.cur_paper_emb = self.entity_embeddings[self.cur_paper[0]]
+            #     except KeyError:
+            #         print(f"paper{self.query_paper}'s reference {self.cur_paper} does not exist in entity embeddings")
+            # else:
+            #     self.cur_paper_emb = self.entity_embeddings[self.query_paper + self.cur_paper[1]]
             cur_id = self.cur_paper[0] or (self.query_paper + self.cur_paper[1])
             self.cur_paper_emb = self.entity_embeddings.get(cur_id, self.default_emb)
             cur_sims = torch.cosine_similarity(self.global_paper_matrix, self.cur_paper_emb.unsqueeze(0))
@@ -222,17 +257,21 @@ class PSTEnv(object):
             self.test_index += 1  # random.randint(0, len(self.train_keys)), or sequentially
             self.done = False
             self.query_paper = self.valid_keys[self.test_index % len(self.valid_data)]  # mod to avoid out of index
-            self.cur_data = self.valid_data[self.query_paper]
+            self.cur_data = self.valid_episode_data[self.query_paper]
 
             self.previous_paper = self.cur_data[self.steps]
             self.cur_paper = self.cur_data[self.steps + 1]
 
             self.global_paper_matrix = self.gt_matrix_map[self.query_paper]
+            # self.global_paper_emb_ls = []
+            # for gt in self.gt_ls:
+            #     self.global_paper_emb_ls.append(torch.tensor(self.entity_embeddings[gt]))
 
             p_id = self.previous_paper[0] or (self.query_paper + self.previous_paper[1])
             self.previous_paper_emb = self.entity_embeddings.get(p_id, self.default_emb)
             self.previous_similarity = torch.nn.functional.cosine_similarity(self.global_paper_matrix, self.previous_paper_emb.unsqueeze(0)).max()
-
+            # self.global_state = extract_paper_text_info(
+            #     self.query_paper, query_paper=self.query_paper, context_pos=False, content=True)
             self.global_state = self.query_paper
             actor.global_paper = self.global_state
 
@@ -256,16 +295,26 @@ class PSTEnv(object):
                 rewards.append(reward)          # .item()
                 self.state = next_state
                 self.prev_ls.append(self.previous_paper)
-
+            # gt_pos = int(self.previous_paper[1][1:])
+            # predict = np.zeros(len(self.cur_data))
+            # predict[gt_pos] = 1
             predict = np.zeros(len(self.cur_data))
             for i, prev in enumerate(self.prev_ls):
                 if predict[int(prev[1][1:])] == 0:
                     predict[int(prev[1][1:])] = (i + 1) / len(self.prev_ls)
             tmp_map = average_precision_score(self.gt[self.query_paper], predict)
-
+            # self.reward_dic[self.query_paper] = rewards
+            # self.info_dic[self.query_paper] = self.info
+            # self.prob[self.query_paper] = p_list
             map_ls.append(tmp_map)
             if self.finally_found:            # if finally found, then success
                 self.success += 1
+        # with open(join(save_dir, "reward_{}.json".format(self.test_iter*10)), "w") as f:
+        #     json.dump(self.reward_dic, f)
+        # with open(join(save_dir, "info_{}.json".format(self.test_iter*2)), "w") as f:
+        #     json.dump(self.info_dic, f)
+        # with open(join(save_dir, "prob_{}.json".format(self.test_iter*2)), "w") as f:
+        #     json.dump(self.prob, f)
         return self.success / len(self.valid_data), sum(map_ls)/len(map_ls)      # success rate
 
     def case(self, actor):
@@ -289,17 +338,20 @@ class PSTEnv(object):
             self.test_index += 1  # random.randint(0, len(self.train_keys)), or sequentially
             self.done = False
             self.query_paper = self.valid_keys[self.test_index % len(self.valid_data)]  # mod to avoid out of index
-            self.cur_data = self.valid_data[self.query_paper]
+            self.cur_data = self.valid_episode_data[self.query_paper]
 
             self.previous_paper = self.cur_data[self.steps]
             self.cur_paper = self.cur_data[self.steps + 1]
 
-            self.global_paper_matrix = self.global_paper_matrix[self.query_paper]
+            # self.gt_ls = self.gt_id_map[self.query_paper]
+            self.global_paper_matrix = self.gt_matrix_map[self.query_paper]
 
             p_id = self.previous_paper[0] or (self.query_paper + self.previous_paper[1])
             self.previous_paper_emb = self.entity_embeddings.get(p_id, self.default_emb)
             self.previous_similarity = torch.nn.functional.cosine_similarity(self.global_paper_matrix, self.previous_paper_emb.unsqueeze(0)).max()
 
+            # self.global_state = extract_paper_text_info(
+            #     self.query_paper, query_paper=self.query_paper, context_pos=False, content=True)
             self.global_state = self.query_paper
             actor.global_paper = self.global_state
 
@@ -319,7 +371,8 @@ class PSTEnv(object):
                 p_list.append(float(p[1]))
                 action = 1 if p[1] > 0.5 else 0
                 next_state, reward, done, info_, step_ = self.step(action)  # p[1]: probability of action==1
-
+                # log_probs.append(log_prob)
+                # rewards.append(reward)  # .item()
                 self.state = next_state
                 self.prev_ls.append(self.previous_paper)
 
@@ -328,13 +381,17 @@ class PSTEnv(object):
             for i, prev in enumerate(self.prev_ls):
                 if predict[int(prev[1][1:])] == 0:
                     predict[int(prev[1][1:])] = (i+1)/len(self.prev_ls)
-
+            # gt_pos = int(self.previous_paper[1][1:])
+            #
+            # predict[gt_pos] = 1
             tmp_map = average_precision_score(self.gt[self.query_paper], predict)
             if self.finally_found:
                 self.case_result[self.query_paper] = ("found", self.prev_ls)
             else:
                 self.case_result[self.query_paper] = ("not found", self.prev_ls)
-
+            # self.reward_dic[self.query_paper] = rewards
+            # self.info_dic[self.query_paper] = self.info
+            # self.prob[self.query_paper] = p_list
             map_ls.append(tmp_map)
             if self.finally_found:  # if finally found, then success
                 self.success += 1
@@ -354,6 +411,9 @@ def extract_paper_text_info(paper_id, query_paper, content=False, context_pos=Fa
         if content:
             # only query paper has the content
             text_ls.append(paper_info[paper_id]["content"])
+        # if context_pos is True, return the context position
+    # else:
+    #     print("paper {} does not exist in paper_info".format(paper_id))
 
     try:
         if context_pos:         # query paper does not have context information
